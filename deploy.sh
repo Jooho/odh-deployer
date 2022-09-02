@@ -72,6 +72,7 @@ ODH_NOTEBOOK_PROJECT=${ODH_NOTEBOOK_NAMESPACE:-"rhods-notebooks"}
 CRO_PROJECT=${CRO_NAMESPACE:-"redhat-ods-operator"} # Delete this in 1.17
 ODH_OPERATOR_PROJECT=${OPERATOR_NAMESPACE:-"redhat-ods-operator"}
 NAMESPACE_LABEL="opendatahub.io/generated-namespace=true"
+PLATFORM=${OPENSHIFT_TYPE:-"rhods"}
 
 # ODH Dashboard Defaults
 ADMIN_GROUPS="dedicated-admins"
@@ -160,15 +161,26 @@ else
 fi
 # End Migration code block
 
-# Give dedicated-admins group CRUD access to ConfigMaps, Secrets, ImageStreams, Builds and BuildConfigs in select namespaces
-for target_project in ${ODH_PROJECT} ${ODH_NOTEBOOK_PROJECT}; do
-  oc apply -n $target_project -f rhods-osd-configs.yaml
-  if [ $? -ne 0 ]; then
-    echo "ERROR: Attempt to create the RBAC policy for dedicated admins group in $target_project failed."
-    exit 1
-  fi
-done
+# Check if platform is On-Prem or RHODS
+platform_info=$(oc::wait::object::availability "oc get configmap odh-platform-config -n $ODH_OPERATOR_PROJECT -o jsonpath='{.data.platform}'" 2 10 | tr -d "'")
+if [ -z "$platform_info" ];then
+  echo "INFO: OpenShift Type: Red Hat OpenShift Dedicated"
+else
+  echo "INFO: OpenShift Type: Red Hat OpenShift On Prem"
+  PLATFORM="onprem"
+fi
 
+# RHODS Only
+if [ $PLATFORM == "rhods" ];then
+  # Give dedicated-admins group CRUD access to ConfigMaps, Secrets, ImageStreams, Builds and BuildConfigs in select namespaces
+  for target_project in ${ODH_PROJECT} ${ODH_NOTEBOOK_PROJECT}; do
+    oc apply -n $target_project -f rhods-osd-configs.yaml
+    if [ $? -ne 0 ]; then
+      echo "ERROR: Attempt to create the RBAC policy for dedicated admins group in $target_project failed."
+      exit 1
+    fi
+  done
+fi
 
 oc apply -n ${ODH_PROJECT} -f rhods-dashboard.yaml
 if [ $? -ne 0 ]; then
@@ -195,14 +207,23 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
-deadmanssnitch=$(oc::wait::object::availability "oc get secret -n $ODH_MONITORING_PROJECT redhat-rhods-deadmanssnitch -o jsonpath='{.data.SNITCH_URL}'" 4 90 | tr -d "'"  | base64 --decode)
 
-if [ -z "$deadmanssnitch" ];then
-    echo "ERROR: Dead Man Snitch secret does not exist."
-    exit 1
+
+if [ $PLATFORM != "rhods" ];then
+  sed '/alertmanager.yml:/,$d' -i monitoring/prometheus/prometheus-configs.yaml
 fi
 
-sed -i "s#<snitch_url>#$deadmanssnitch#g" monitoring/prometheus/prometheus-configs.yaml
+
+if [ $PLATFORM == "rhods" ];then
+  deadmanssnitch=$(oc::wait::object::availability "oc get secret -n $ODH_MONITORING_PROJECT redhat-rhods-deadmanssnitch -o jsonpath='{.data.SNITCH_URL}'" 4 90 | tr -d "'"  | base64 --decode)
+
+  if [ -z "$deadmanssnitch" ];then
+      echo "ERROR: Dead Man Snitch secret does not exist."
+      exit 1
+  fi
+
+  sed -i "s#<snitch_url>#$deadmanssnitch#g" monitoring/prometheus/prometheus-configs.yaml
+fi
 
 oc apply -n ${ODH_MONITORING_PROJECT} -f rhods-monitoring.yaml
 
@@ -214,17 +235,20 @@ oc apply -n $ODH_MONITORING_PROJECT -f monitoring/prometheus/alertmanager-svc.ya
 
 alertmanager_host=$(oc::wait::object::availability "oc get route alertmanager -n $ODH_MONITORING_PROJECT -o jsonpath='{.spec.host}'" 2 30 | tr -d "'")
 
-# Check if pagerduty secret exists, if not, exit installation
+# RHODS Only
+if [ $PLATFORM == "rhods" ];then
+  # Check if pagerduty secret exists, if not, exit installation
+  redhat_rhods_pagerduty=$(oc::wait::object::availability "oc get secret redhat-rhods-pagerduty -n $ODH_MONITORING_PROJECT" 5 60 )
 
-redhat_rhods_pagerduty=$(oc::wait::object::availability "oc get secret redhat-rhods-pagerduty -n $ODH_MONITORING_PROJECT" 5 60 )
+  if [ -z "$redhat_rhods_pagerduty" ];then
+      echo "ERROR: Pagerduty secret does not exist."
+      exit 1
+  fi
 
-if [ -z "$redhat_rhods_pagerduty" ];then
-    echo "ERROR: Pagerduty secret does not exist."
-    exit 1
+  pagerduty_service_token=$(oc::wait::object::availability "oc get secret redhat-rhods-pagerduty -n $ODH_MONITORING_PROJECT -o jsonpath='{.data.PAGERDUTY_KEY}'" 5 10)
+  pagerduty_service_token=$(echo -ne "$pagerduty_service_token" | tr -d "'" | base64 --decode)
+  sed -i "s/<pagerduty_token>/$pagerduty_service_token/g" monitoring/prometheus/prometheus-configs.yaml
 fi
-
-pagerduty_service_token=$(oc::wait::object::availability "oc get secret redhat-rhods-pagerduty -n $ODH_MONITORING_PROJECT -o jsonpath='{.data.PAGERDUTY_KEY}'" 5 10)
-pagerduty_service_token=$(echo -ne "$pagerduty_service_token" | tr -d "'" | base64 --decode)
 
 oc apply -f monitoring/rhods-dashboard-route.yaml -n $ODH_PROJECT
 
@@ -235,32 +259,34 @@ notebook_spawner_host=$(oc::wait::object::availability "oc get route rhods-dashb
 
 sed -i "s/<rhods_dashboard_host>/$rhods_dashboard_host/g" monitoring/prometheus/prometheus-configs.yaml
 sed -i "s/<notebook_spawner_host>/$notebook_spawner_host/g" monitoring/prometheus/prometheus-configs.yaml
-sed -i "s/<pagerduty_token>/$pagerduty_service_token/g" monitoring/prometheus/prometheus-configs.yaml
 sed -i "s/<set_alertmanager_host>/$alertmanager_host/g" monitoring/prometheus/prometheus.yaml
 
-# Check if smtp secret exists, exit if it doesn't
-redhat_rhods_smtp=$(oc::wait::object::availability "oc get secret redhat-rhods-smtp -n $ODH_MONITORING_PROJECT" 5 60 )
+# RHODS Only
+if [ $PLATFORM == "rhods" ];then
+  # Check if smtp secret exists, exit if it doesn't
+  redhat_rhods_smtp=$(oc::wait::object::availability "oc get secret redhat-rhods-smtp -n $ODH_MONITORING_PROJECT" 5 60 )
 
-if [ -z "$redhat_rhods_smtp" ];then
-    echo "ERROR: SMTP secret does not exist."
-    exit 1
+  if [ -z "$redhat_rhods_smtp" ];then
+      echo "ERROR: SMTP secret does not exist."
+      exit 1
+  fi
+
+  # Check if addon parameter for mail secret exists, exit if it doesn't
+
+  addon_managed_odh_parameter=$(oc::wait::object::availability "oc get secret addon-managed-odh-parameters -n $ODH_OPERATOR_PROJECT" 5 60 )
+
+  if [ -z "$addon_managed_odh_parameter" ];then
+      echo "ERROR: Addon managed odh parameter secret does not exist."
+      exit 1
+  fi
+
+  sed -i "s/<smtp_host>/$(oc::wait::object::availability "oc get secret -n $ODH_MONITORING_PROJECT redhat-rhods-smtp -o jsonpath='{.data.host}'" 2 30 | tr -d "'"  | base64 --decode)/g" monitoring/prometheus/prometheus-configs.yaml
+  sed -i "s/<smtp_port>/$(oc::wait::object::availability "oc get secret -n $ODH_MONITORING_PROJECT redhat-rhods-smtp -o jsonpath='{.data.port}'" 2 30 | tr -d "'"  | base64 --decode)/g" monitoring/prometheus/prometheus-configs.yaml
+  sed -i "s/<smtp_username>/$(oc::wait::object::availability "oc get secret -n $ODH_MONITORING_PROJECT redhat-rhods-smtp -o jsonpath='{.data.username}'" 2 30 | tr -d "'"  | base64 --decode)/g" monitoring/prometheus/prometheus-configs.yaml
+  sed -i "s/<smtp_password>/$(oc::wait::object::availability "oc get secret -n $ODH_MONITORING_PROJECT redhat-rhods-smtp -o jsonpath='{.data.password}'" 2 30 | tr -d "'"  | base64 --decode)/g" monitoring/prometheus/prometheus-configs.yaml
+
+  sed -i "s/<user_emails>/$(oc::wait::object::availability "oc get secret -n $ODH_OPERATOR_PROJECT addon-managed-odh-parameters -o jsonpath='{.data.notification-email}'" 2 30 | tr -d "'"  | base64 --decode)/g" monitoring/prometheus/prometheus-configs.yaml
 fi
-
-# Check if addon parameter for mail secret exists, exit if it doesn't
-
-addon_managed_odh_parameter=$(oc::wait::object::availability "oc get secret addon-managed-odh-parameters -n $ODH_OPERATOR_PROJECT" 5 60 )
-
-if [ -z "$addon_managed_odh_parameter" ];then
-    echo "ERROR: Addon managed odh parameter secret does not exist."
-    exit 1
-fi
-
-sed -i "s/<smtp_host>/$(oc::wait::object::availability "oc get secret -n $ODH_MONITORING_PROJECT redhat-rhods-smtp -o jsonpath='{.data.host}'" 2 30 | tr -d "'"  | base64 --decode)/g" monitoring/prometheus/prometheus-configs.yaml
-sed -i "s/<smtp_port>/$(oc::wait::object::availability "oc get secret -n $ODH_MONITORING_PROJECT redhat-rhods-smtp -o jsonpath='{.data.port}'" 2 30 | tr -d "'"  | base64 --decode)/g" monitoring/prometheus/prometheus-configs.yaml
-sed -i "s/<smtp_username>/$(oc::wait::object::availability "oc get secret -n $ODH_MONITORING_PROJECT redhat-rhods-smtp -o jsonpath='{.data.username}'" 2 30 | tr -d "'"  | base64 --decode)/g" monitoring/prometheus/prometheus-configs.yaml
-sed -i "s/<smtp_password>/$(oc::wait::object::availability "oc get secret -n $ODH_MONITORING_PROJECT redhat-rhods-smtp -o jsonpath='{.data.password}'" 2 30 | tr -d "'"  | base64 --decode)/g" monitoring/prometheus/prometheus-configs.yaml
-
-sed -i "s/<user_emails>/$(oc::wait::object::availability "oc get secret -n $ODH_OPERATOR_PROJECT addon-managed-odh-parameters -o jsonpath='{.data.notification-email}'" 2 30 | tr -d "'"  | base64 --decode)/g" monitoring/prometheus/prometheus-configs.yaml
 
 oc apply -n $ODH_MONITORING_PROJECT -f monitoring/prometheus/blackbox-exporter-common.yaml
 
