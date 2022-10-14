@@ -10,6 +10,11 @@ spec:
         path: odh-common
     name: odh-common
   - kustomizeConfig:
+      parameters:
+      - name: odh-minimal-notebook-image-digest
+        value: $ODH_MINIMAL_NOTEBOOK_IMAGE_DIGEST
+      - name: generic-data-science-notebook-image-digest
+        value: $GENERIC_DATA_SCIENCE_NOTEBOOK_IMAGE_DIGEST
       overlays:
       - additional
       repoRef:
@@ -17,6 +22,11 @@ spec:
         path: jupyterhub/notebook-images
     name: notebook-images
   - kustomizeConfig:
+      parameters:
+      - name: odh-notebook-image-digest
+        value: $ODH_NOTEBOOK_IMAGE_DIGEST
+      - name: kf-notebook-image-digest
+        value: $KF_NOTEBOOK_IMAGE_DIGEST
       repoRef:
         name: manifests
         path: odh-notebook-controller

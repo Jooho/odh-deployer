@@ -16,3 +16,7 @@ spec:
   - name: manifests
     uri: file:///opt/manifests/odh-manifests.tar.gz
   version: v1.0.0
+  # repos:
+  # - name: manifests
+  #   uri: https://github.com/Jooho/odh-manifests/tarball/digest_test
+  # version: rhds-master
